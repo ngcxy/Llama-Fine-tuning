@@ -18,10 +18,10 @@ class Generation(nn.Module):
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != tokenizer.pad_id
 
-        prev_pos = 0
+        # prev_pos = 0
         for cur_pos in range(min_prompt_len, total_len):
             with torch.no_grad():
-                logits = self(tokens[:, prev_pos:cur_pos], prev_pos)
+                logits = self(tokens[:, :cur_pos], 0)
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)
@@ -39,7 +39,7 @@ class Generation(nn.Module):
                 next_token == tokenizer.eos_id
             )
  
-            prev_pos = cur_pos
+            #prev_pos = cur_pos
             if all(eos_reached):
                 break
 
