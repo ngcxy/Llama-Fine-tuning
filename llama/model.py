@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from llama.generation import Generation
+from llama.lora import Linear as LoRALinear
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -18,13 +20,13 @@ class ModelArgs:
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
-    vocab_size: int = 32000  
+    vocab_size: int = 32000
     multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
     ffn_dim_multiplier: Optional[float] = None
     norm_eps: float = 1e-5
 
     max_batch_size: int = 4
-    max_seq_len: int = 128
+    max_seq_len: int = 512  # modify to a larger max_seq_len
 
 
 class RMSNorm(torch.nn.Module):
@@ -115,16 +117,18 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
         AssertionError: If the target tensor 'x' doesn't have the expected number of dimensions.
     """
     ndim = x.ndim
+    # print(ndim)
     assert 0 <= 1 < ndim
+    # print(f"--{freqs_cis.shape}--{x.shape[1]}--{x.shape[-1]}")
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
 
 def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
+        xq: torch.Tensor,
+        xk: torch.Tensor,
+        freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary embeddings to input tensors using the given frequency tensor.
@@ -164,6 +168,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 class Attention(nn.Module):
     """Multi-head attention module."""
+
     def __init__(self, args: ModelArgs):
         """
         Initialize the Attention module.
@@ -192,10 +197,16 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        # LoRA Linear
+
+        self.wq = LoRALinear(args.dim, args.n_heads * self.head_dim, merge_weights=False, bias=False)
+        self.wv = LoRALinear(args.dim, self.n_kv_heads * self.head_dim, merge_weights=False, bias=False)
+        # self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim, bias=False)
+        # self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
+
+        # remove KV caching
 
         # self.cache_k = torch.zeros(
         #     (
@@ -215,11 +226,10 @@ class Attention(nn.Module):
         # ).cuda()
 
     def forward(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
+            self,
+            x: torch.Tensor,
+            freqs_cis: torch.Tensor,
+            mask: Optional[torch.Tensor],
     ):
         """
         Forward pass of the attention module.
@@ -243,6 +253,8 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        # remove KV caching
+
         # self.cache_k = self.cache_k.to(xq)
         # self.cache_v = self.cache_v.to(xq)
 
@@ -257,11 +269,12 @@ class Attention(nn.Module):
         values = repeat_kv(values, self.n_rep)  # (bs, cache_len + seqlen, n_local_heads, head_dim)
 
         xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(1, 2) # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
         scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        # print(f"{scores.shape} -- {mask.shape} -- {keys.shape} -- {values.shape}")
         if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = mask + scores  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
@@ -270,11 +283,11 @@ class Attention(nn.Module):
 
 class FeedForward(nn.Module):
     def __init__(
-        self,
-        dim: int,
-        hidden_dim: int,
-        multiple_of: int,
-        ffn_dim_multiplier: Optional[float],
+            self,
+            dim: int,
+            hidden_dim: int,
+            multiple_of: int,
+            ffn_dim_multiplier: Optional[float],
     ):
         """
         Initialize the FeedForward module.
@@ -342,11 +355,10 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        start_pos: int,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor],
+            self,
+            x: torch.Tensor,
+            freqs_cis: torch.Tensor,
+            mask: Optional[torch.Tensor],
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -362,10 +374,26 @@ class TransformerBlock(nn.Module):
 
         """
         h = x + self.attention.forward(
-            self.attention_norm(x), start_pos, freqs_cis, mask
+            self.attention_norm(x), freqs_cis, mask
         )
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
+
+        # # gradient checkpoint
+        # def custom_attention(x, freqs_cis, mask):
+        #     return x + self.attention(self.attention_norm(x), freqs_cis, mask)
+
+        # def custom_feed_forward(h):
+        #     return h + self.feed_forward.forward(self.ffn_norm(h))
+
+        # if self.training:
+        #     h = checkpoint(custom_attention, x, freqs_cis, mask, use_reentrant=False)
+        #     out = checkpoint(custom_feed_forward, h, use_reentrant=False)
+        # else:
+        #     h = custom_attention(x, freqs_cis, mask)
+        #     out = custom_feed_forward(h)
+
+        # return out
 
 
 class Llama(Generation):
@@ -402,12 +430,12 @@ class Llama(Generation):
         self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
 
         self.freqs_cis = precompute_freqs_cis(
-            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096. 
+            # Note that self.params.max_seq_len is multiplied by 2 because the token limit for the Llama 2 generation of models is 4096.
             # Adding this multiplier instead of using 4096 directly allows for dynamism of token lengths while training or fine-tuning.
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
         )
 
-    def forward(self, tokens: torch.Tensor, start_pos: int):
+    def forward(self, tokens: torch.Tensor):
         """
         Perform a forward pass through the Transformer model.
 
@@ -422,7 +450,7 @@ class Llama(Generation):
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
         self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        freqs_cis = self.freqs_cis[: seqlen]
 
         mask = None
         if seqlen > 1:
@@ -442,7 +470,7 @@ class Llama(Generation):
             # ]).type_as(h)
 
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
+            h = layer(h, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
         return output
