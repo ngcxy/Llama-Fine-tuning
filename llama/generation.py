@@ -21,7 +21,7 @@ class Generation(nn.Module):
         # prev_pos = 0
         for cur_pos in range(min_prompt_len, total_len):
             with torch.no_grad():
-                logits = self(tokens[:, :cur_pos], 0)
+                logits = self(tokens[:, :cur_pos])
             if temperature > 0:
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                 next_token = sample_top_p(probs, top_p)

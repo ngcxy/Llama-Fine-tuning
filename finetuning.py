@@ -232,6 +232,10 @@ def train():
 
     end_timer_and_print()
 
+    model_weights = model.state_dict()
+    lora_weights = {k: v for k, v in model_weights.items() if "lora_" in k}
+    torch.save(lora_weights, "/home1/xcai6647/lora_weight.pth")
+
 
 if __name__ == "__main__":
     train()
