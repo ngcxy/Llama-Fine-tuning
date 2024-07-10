@@ -29,8 +29,6 @@ PROMPT_DICT = {
 # -----------------------------
 # Timing & Memory utilities
 
-start_time = None
-
 
 def start_timer():
     global start_time
@@ -143,7 +141,7 @@ def train():
     # load model
     checkpoint = torch.load(model_path, map_location="cpu")
     model_args = ModelArgs()
-    model_args.n_layers = 32  # for debugging purposes we only use 1 layer
+    model_args.n_layers = 1  # for debugging purposes we only use 1 layer
     # torch.set_default_tensor_type(torch.cuda.HalfTensor) # for training we use fp32 weights
     model = Llama(model_args)
     model.load_state_dict(checkpoint, strict=False)
